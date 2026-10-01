@@ -162,8 +162,15 @@ class InventoryService:
         if holds:
             raise ConflictError("批次存在未解除的质量或权限冻结", context={"holds": [item["id"] for item in holds]})
         quantity = float(data["quantity_grams"])
-        if quantity > float(lot["available_weight_grams"]) + 1e-9:
-            raise ConflictError("批次可用重量不足")
+        locked = float(self.connection.execute(
+            "SELECT COALESCE(SUM(quantity_grams - picked_grams),0) FROM reservation_lines "
+            "WHERE lot_id=? AND status IN ('active','picking')", (lot["id"],)
+        ).fetchone()[0])
+        if quantity > float(lot["available_weight_grams"]) - locked + 1e-9:
+            raise ConflictError(
+                "批次可用重量不足（已被发放预约锁定的重量不能领用或报废）",
+                context={"on_hand_grams": lot["available_weight_grams"], "reserved_grams": round(locked, 6)},
+            )
         timestamp = to_storage(self.clock.now())
         remaining = round(float(lot["available_weight_grams"]) - quantity, 6)
         status = "depleted" if remaining <= 1e-9 else lot["status"]
@@ -198,6 +205,12 @@ class InventoryService:
         self.connection.execute(
             "UPDATE seed_lots SET status='held',version=version+1,updated_at=? WHERE id=? AND status NOT IN ('depleted','disposed')",
             (timestamp, lot["id"]),
+        )
+        # 质量状态恶化：释放该批次上尚未进入拣货的预约锁定，并尝试用其他批次补足。
+        from app.germplasm.reservations import ReservationService
+
+        ReservationService(self.connection, self.clock).release_lot_for_quality(
+            int(lot["id"]), f"{data['hold_type']}冻结：{data['reason']}"
         )
         return record(self.connection.execute("SELECT * FROM lot_holds WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
 

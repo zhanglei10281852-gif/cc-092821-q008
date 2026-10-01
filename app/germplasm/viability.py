@@ -49,8 +49,15 @@ class ViabilityService:
             raise ValidationError("检测规程与资源作物不匹配")
         if lot["status"] in {"depleted", "disposed"}:
             raise ConflictError("耗尽或报废批次不能安排检测")
-        if float(data["sampled_grams"]) > float(lot["available_weight_grams"]):
-            raise ConflictError("检测取样重量超过批次可用重量")
+        locked = float(self.connection.execute(
+            "SELECT COALESCE(SUM(quantity_grams - picked_grams),0) FROM reservation_lines "
+            "WHERE lot_id=? AND status IN ('active','picking')", (lot["id"],)
+        ).fetchone()[0])
+        if float(data["sampled_grams"]) > float(lot["available_weight_grams"]) - locked + 1e-9:
+            raise ConflictError(
+                "检测取样重量超过批次可用重量（已预约锁定部分不可动用）",
+                context={"on_hand_grams": lot["available_weight_grams"], "reserved_grams": round(locked, 6)},
+            )
         active = self.connection.execute(
             "SELECT id FROM viability_tests WHERE lot_id=? AND status IN ('scheduled','running')",
             (lot["id"],),

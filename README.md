@@ -48,7 +48,18 @@ python -m app.cli demo
 - `app/germplasm/inventory.py` 管理批次、库位容量、容器摆放、移动、领用和冻结。
 - `app/germplasm/viability.py` 管理检测规程、取样、重复计数、活力结果与复检日程。
 - `app/germplasm/quality.py` 管理温湿度读数、偏离告警和种质发放审批。
+- `app/germplasm/reservations.py` 管理有期限的库存预约：批准即锁定、到期/取消/质量恶化释放、拣货与整单回退、余额与分配溯源。
 - `app/api`、`app/services` 和 `app/repositories` 提供身份、权限、审计、后台作业及维护能力。
+
+## 库存预约
+
+审批通过时不再只记录一个批次编号，而是在同一立即事务内按 **资源限制 → 质量冻结 → 最近有效活力 → 先到期先用（FEFO）** 的顺序选择一个或多个批次，按 `sequence_no` 逐批锁定重量（可跨批拆分），并在每条预约行的 `rule_json` 中快照当时的活力结果、实物/已锁定重量与命中的规则，作为出库分配顺序的证据。
+
+- 并发审批由 `BEGIN IMMEDIATE` 串行化，配合 `reservation_lines` 上的超卖触发器双重兜底，保证不超卖；审批重放返回既有预约，不重复占用。
+- 预约默认 7 天有效（审批时可在 1–90 天内指定 `reservation_days`）。到期、申请取消或批次被质量冻结时释放余额并写入 `reservation_events`；质量释放后自动按同一规则从其他批次补足缺口，补不齐则整单退回待审批。
+- 已进入拣货的预约不再被到期/取消/质量冻结抢占，只能由具备 `distribution.manage` 权限的人员接管（`/takeover`）或整单回退（`/rollback`，自动把已拣重量归还库存）；普通拣货员需要 `distribution.pick`。
+- 服务启动时自动回收过期预约；也可通过 `POST /api/germplasm/reservations/reclaim-expired` 或 `python -m app.cli reclaim-expired` 手动回收。
+- `GET /api/germplasm/lots/{id}` 与 `GET /api/germplasm/distributions/{id}` 均展示实物、已预约、可再预约、已出库数量；`GET /api/germplasm/lots/{id}/reservations` 返回该批次面向各申请的分配顺序、规则快照、拣货流水与最终运单/收货方，出库人员可据此证明每份材料的去向。
 
 ## 一致性约定
 

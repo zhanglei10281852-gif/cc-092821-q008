@@ -138,6 +138,12 @@ class AccessionService:
         if cursor.rowcount != 1:
             raise ConflictError("种质资源状态版本冲突")
         self._event(accession_id, "status_changed", data["actor"], current, target, {"reason": reason})
+        if target in {"restricted", "retired"}:
+            from app.germplasm.reservations import ReservationService
+
+            ReservationService(self.connection, self.clock).release_accession_for_restriction(
+                accession_id, f"资源状态转为 {target}：{reason}"
+            )
         self._outbox(
             f"accession-status-{accession_id}-{int(before['version']) + 1}", "accession.status.changed",
             "accession", accession_id, {"from": current, "to": target, "reason": reason}, timestamp,

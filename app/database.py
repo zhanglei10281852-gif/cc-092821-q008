@@ -359,7 +359,7 @@ CREATE TABLE IF NOT EXISTS distribution_requests (
     request_no TEXT NOT NULL UNIQUE,
     requester TEXT NOT NULL,
     purpose TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','submitted','approved','rejected','fulfilled','cancelled')),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','submitted','approved','picking','rejected','fulfilled','cancelled')),
     requested_at TEXT NOT NULL,
     reviewed_by TEXT,
     reviewed_at TEXT,
@@ -375,6 +375,103 @@ CREATE TABLE IF NOT EXISTS distribution_items (
     status TEXT NOT NULL DEFAULT 'requested' CHECK(status IN ('requested','allocated','fulfilled','unavailable')),
     UNIQUE(request_id,accession_id)
 );
+CREATE TABLE IF NOT EXISTS reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES distribution_requests(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK(status IN ('active','picking','fulfilled','released')),
+    release_reason TEXT CHECK(release_reason IS NULL OR release_reason IN ('expired','cancelled','quality_hold','restriction','manual')),
+    expires_at TEXT NOT NULL,
+    allocation_rule TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    taken_over_by TEXT,
+    taken_over_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    released_at TEXT,
+    released_by TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_request_open
+ON reservations(request_id) WHERE status IN ('active','picking');
+CREATE INDEX IF NOT EXISTS idx_reservations_expiry ON reservations(status,expires_at);
+CREATE TABLE IF NOT EXISTS reservation_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id INTEGER NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    request_item_id INTEGER NOT NULL REFERENCES distribution_items(id) ON DELETE CASCADE,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    sequence_no INTEGER NOT NULL CHECK(sequence_no > 0),
+    quantity_grams REAL NOT NULL CHECK(quantity_grams > 0),
+    picked_grams REAL NOT NULL DEFAULT 0 CHECK(picked_grams >= 0),
+    status TEXT NOT NULL CHECK(status IN ('active','picking','fulfilled','released')),
+    release_reason TEXT,
+    rule_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    picked_at TEXT,
+    released_at TEXT,
+    released_by TEXT,
+    UNIQUE(reservation_id,request_item_id,sequence_no)
+);
+CREATE INDEX IF NOT EXISTS idx_rlines_lot ON reservation_lines(lot_id,status);
+CREATE INDEX IF NOT EXISTS idx_rlines_item ON reservation_lines(request_item_id);
+CREATE TRIGGER IF NOT EXISTS trg_rlines_no_oversell_insert
+AFTER INSERT ON reservation_lines
+WHEN NEW.status IN ('active','picking')
+BEGIN
+    SELECT CASE WHEN (
+        SELECT COALESCE(SUM(quantity_grams - picked_grams),0) FROM reservation_lines
+        WHERE lot_id=NEW.lot_id AND status IN ('active','picking')
+    ) > (SELECT available_weight_grams FROM seed_lots WHERE id=NEW.lot_id) + 0.000001
+    THEN RAISE(ABORT,'批次可预约重量不足，禁止超卖') END;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_rlines_no_oversell_update
+AFTER UPDATE OF quantity_grams,picked_grams,status,lot_id ON reservation_lines
+WHEN NEW.status IN ('active','picking')
+BEGIN
+    SELECT CASE WHEN (
+        SELECT COALESCE(SUM(quantity_grams - picked_grams),0) FROM reservation_lines
+        WHERE lot_id=NEW.lot_id AND status IN ('active','picking')
+    ) > (SELECT available_weight_grams FROM seed_lots WHERE id=NEW.lot_id) + 0.000001
+    THEN RAISE(ABORT,'批次可预约重量不足，禁止超卖') END;
+END;
+CREATE TABLE IF NOT EXISTS reservation_fulfillments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_line_id INTEGER NOT NULL REFERENCES reservation_lines(id) ON DELETE RESTRICT,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    movement_id INTEGER REFERENCES lot_movements(id),
+    kind TEXT NOT NULL CHECK(kind IN ('pick','return')),
+    quantity_grams REAL NOT NULL CHECK(quantity_grams > 0),
+    shipment_no TEXT,
+    consignee TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rf_line ON reservation_fulfillments(reservation_line_id);
+CREATE INDEX IF NOT EXISTS idx_rf_lot ON reservation_fulfillments(lot_id);
+CREATE TRIGGER IF NOT EXISTS trg_rf_bounds
+AFTER INSERT ON reservation_fulfillments
+BEGIN
+    SELECT CASE WHEN (
+        SELECT COALESCE(SUM(CASE WHEN kind='pick' THEN quantity_grams ELSE -quantity_grams END),0)
+        FROM reservation_fulfillments WHERE reservation_line_id=NEW.reservation_line_id
+    ) < -0.000001
+    THEN RAISE(ABORT,'回退重量不能超过该预约明细已拣货重量') END;
+    SELECT CASE WHEN (
+        SELECT COALESCE(SUM(CASE WHEN kind='pick' THEN quantity_grams ELSE -quantity_grams END),0)
+        FROM reservation_fulfillments WHERE reservation_line_id=NEW.reservation_line_id
+    ) > (SELECT quantity_grams FROM reservation_lines WHERE id=NEW.reservation_line_id) + 0.000001
+    THEN RAISE(ABORT,'拣货重量不能超过预约锁定重量') END;
+END;
+CREATE TABLE IF NOT EXISTS reservation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id INTEGER NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    reservation_line_id INTEGER REFERENCES reservation_lines(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_revents_reservation ON reservation_events(reservation_id,id);
 CREATE TABLE IF NOT EXISTS outbox_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_key TEXT NOT NULL UNIQUE,
@@ -411,6 +508,8 @@ PERMISSIONS = [
     ("viability.write", "执行活力检测", "viability", "write"),
     ("quality.review", "复核质量结果", "quality", "review"),
     ("distribution.approve", "审批种质发放", "distribution", "approve"),
+    ("distribution.pick", "拣货出库", "distribution", "pick"),
+    ("distribution.manage", "接管与回退预约", "distribution", "manage"),
 ]
 
 
@@ -495,9 +594,9 @@ def init_db() -> None:
             (administrator, timestamp),
         )
         role_permissions = {
-            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
+            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write", "distribution.pick"],
             "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
-            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
+            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve", "distribution.manage"],
             "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
         }
         for role_code, codes in role_permissions.items():

@@ -7,6 +7,7 @@ from app.germplasm.accessions import AccessionService
 from app.germplasm.inventory import InventoryService
 from app.germplasm.quality import DistributionService, QualityService
 from app.germplasm.repository import GermplasmRepository
+from app.germplasm.reservations import ReservationService
 from app.germplasm.viability import ViabilityService
 
 
@@ -21,6 +22,7 @@ class GermplasmService:
         self.viability = ViabilityService(connection, clock)
         self.quality = QualityService(connection, clock)
         self.distribution = DistributionService(connection, clock)
+        self.reservations = ReservationService(connection, clock)
 
     def dashboard(self) -> dict:
         return {

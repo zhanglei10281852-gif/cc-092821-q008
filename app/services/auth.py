@@ -104,7 +104,7 @@ class AuthService:
         now = self.clock.now()
         expires_at = from_storage(session["expires_at"])
         if expires_at is None or expires_at <= now:
-            self.connection.execute(
+            self._heartbeat(
                 "UPDATE sessions SET revoked_at=?,revoke_reason='expired' WHERE id=?",
                 (to_storage(now), session["id"]),
             )
@@ -112,7 +112,9 @@ class AuthService:
         user = self.users.require(session["user_id"])
         if user["status"] != "active":
             raise AuthenticationError("账号不可用")
-        self.connection.execute("UPDATE sessions SET last_seen_at=? WHERE id=?", (to_storage(now), session["id"]))
+        # 会话心跳在路由事务开启前执行：必须自行提交，否则隐式事务会泄漏到后续请求，
+        # 导致 transaction() 误判为嵌套事务而使该线程上的写入全部无法落盘。
+        self._heartbeat("UPDATE sessions SET last_seen_at=? WHERE id=?", (to_storage(now), session["id"]))
         return Principal(
             user_id=user["id"],
             username=user["username"],
@@ -121,6 +123,19 @@ class AuthService:
             permissions=frozenset(self.users.permissions(user["id"])),
             session_id=session["id"],
         )
+
+    def _heartbeat(self, sql: str, params: tuple) -> None:
+        if self.connection.in_transaction:
+            # 已处于调用方事务中（如测试或嵌套调用），随外层事务提交。
+            self.connection.execute(sql, params)
+            return
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(sql, params)
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def logout(self, principal: Principal) -> None:
         now = to_storage(self.clock.now())

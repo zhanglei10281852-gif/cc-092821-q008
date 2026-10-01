@@ -196,10 +196,18 @@ class GermplasmRepository:
 
     def distribution_detail(self, request_id: int) -> dict[str, Any]:
         item = self.require_distribution(request_id)
-        item["items"] = records(self.connection.execute(
-            "SELECT i.*,a.accession_no,a.crop_name FROM distribution_items i "
-            "JOIN accessions a ON a.id=i.accession_id WHERE i.request_id=? ORDER BY i.id", (request_id,)
+        rows = records(self.connection.execute(
+            "SELECT i.*,a.accession_no,a.crop_name,"
+                        "(SELECT MIN(ln.lot_id) FROM reservation_lines ln WHERE ln.request_item_id=i.id "
+            "AND ln.status IN ('active','picking','fulfilled') "
+            "HAVING COUNT(DISTINCT ln.lot_id)=1) AS resolved_lot_id "
+            "FROM distribution_items i JOIN accessions a ON a.id=i.accession_id "
+            "WHERE i.request_id=? ORDER BY i.id", (request_id,)
         ).fetchall())
+        for row in rows:
+            # 分配已迁移到 reservation_lines（可跨批次）；单一批次时回填旧字段保持兼容。
+            row["allocated_lot_id"] = row.get("allocated_lot_id") or row.pop("resolved_lot_id", None)
+        item["items"] = rows
         return item
 
     def count_table(self, table: str) -> int:

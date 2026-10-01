@@ -14,6 +14,7 @@ from app.germplasm.schemas import (
     AccessionTransition,
     AlertDecision,
     CountCreate,
+    DistributionCancel,
     DistributionCreate,
     DistributionDecision,
     HoldCreate,
@@ -25,6 +26,10 @@ from app.germplasm.schemas import (
     PolicyCreate,
     ProtocolCreate,
     ReadingCreate,
+    ReservationActor,
+    ReservationPick,
+    ReservationReturn,
+    ReservationRollback,
     SourceCreate,
     TestComplete,
     TestCreate,
@@ -157,7 +162,22 @@ def create_lot(data: LotCreate, principal: Principal = Depends(current_principal
 @router.get("/lots/{lot_id}")
 def lot_detail(lot_id: int, principal: Principal = Depends(current_principal)) -> dict:
     principal.require("inventory.read")
-    return _service().repository.lot_detail(lot_id)
+    service = _service()
+    detail = service.repository.lot_detail(lot_id)
+    detail["balance"] = service.reservations.lot_balance(lot_id)
+    return detail
+
+
+@router.get("/lots/{lot_id}/reservations")
+def lot_reservations(lot_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("inventory.read")
+    service = _service()
+    lot = service.repository.require_lot(lot_id)
+    return {
+        "lot": lot,
+        "balance": service.reservations.lot_balance(lot_id),
+        "allocations": service.reservations.lot_allocations(lot_id),
+    }
 
 
 @router.get("/lots/{lot_id}/reconcile")
@@ -351,4 +371,105 @@ def decide_distribution(
 @router.get("/distributions/{request_id}")
 def distribution_detail(request_id: int, principal: Principal = Depends(current_principal)) -> dict:
     principal.require("accessions.read")
-    return _service().repository.distribution_detail(request_id)
+    service = _service()
+    detail = service.repository.distribution_detail(request_id)
+    row = service.reservations.latest_reservation_of_request(request_id)
+    if row is not None:
+        detail["reservation"] = service.reservations.reservation_detail(int(row["id"]))
+    return detail
+
+
+@router.get("/distributions/{request_id}/reservation")
+def distribution_reservation(request_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("accessions.read")
+    service = _service()
+    row = service.reservations.latest_reservation_of_request(request_id)
+    if row is None:
+        from app.core.errors import NotFoundError
+
+        raise NotFoundError("该申请没有库存预约记录")
+    return service.reservations.reservation_detail(int(row["id"]))
+
+
+@router.post("/distributions/{request_id}/cancel")
+def cancel_distribution(
+    request_id: int,
+    data: DistributionCancel,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("distribution.manage")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).reservations.cancel(request_id, data.actor, data.reason)
+
+
+@router.post("/reservations/reclaim-expired")
+def reclaim_expired(principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("distribution.manage")
+    with transaction(immediate=True) as connection:
+        reclaimed = GermplasmService(connection).reservations.expire_due()
+    return {"reclaimed_count": len(reclaimed), "reservations": reclaimed}
+
+
+@router.get("/reservations/{reservation_id}")
+def reservation_detail(reservation_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("accessions.read")
+    return _service().reservations.reservation_detail(reservation_id)
+
+
+@router.post("/reservations/{reservation_id}/picking")
+def start_picking(
+    reservation_id: int,
+    data: ReservationActor,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("distribution.pick")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).reservations.start_picking(reservation_id, data.actor)
+
+
+@router.post("/reservations/{reservation_id}/takeover")
+def takeover_reservation(
+    reservation_id: int,
+    data: ReservationActor,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("distribution.manage")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).reservations.takeover(reservation_id, data.actor)
+
+
+@router.post("/reservations/{reservation_id}/rollback")
+def rollback_reservation(
+    reservation_id: int,
+    data: ReservationRollback,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("distribution.manage")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).reservations.rollback(reservation_id, data.actor, data.reason)
+
+
+@router.post("/reservation-lines/{line_id}/picks", status_code=201)
+def pick_reservation_line(
+    line_id: int,
+    data: ReservationPick,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("distribution.pick")
+    payload = data.model_dump(mode="json")
+    payload["_can_manage"] = principal.can("distribution.manage")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).reservations.pick(line_id, payload)
+
+
+@router.post("/reservation-lines/{line_id}/returns", status_code=201)
+def return_reservation_line(
+    line_id: int,
+    data: ReservationReturn,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("distribution.pick")
+    payload = data.model_dump(mode="json")
+    payload["_can_manage"] = principal.can("distribution.manage")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).reservations.return_line(line_id, payload)

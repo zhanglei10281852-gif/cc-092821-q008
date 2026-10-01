@@ -198,45 +198,28 @@ class DistributionService:
 
     def decide(self, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
         request = self.repository.require_distribution(request_id)
-        if request["status"] != "submitted":
-            raise ConflictError("只有已提交申请可以审批")
-        if int(request["version"]) != int(data["expected_version"]):
-            raise ConflictError("发放申请版本冲突", context={"current_version": request["version"]})
-        timestamp = to_storage(self.clock.now())
+        if request["status"] not in {"submitted", "approved", "picking"}:
+            if request["status"] == "draft":
+                raise ConflictError("只有已提交申请可以审批")
+            raise ConflictError("当前申请状态不能审批")
         if not data["approve"]:
+            if request["status"] != "submitted":
+                raise ConflictError("只有待审批申请可以拒绝")
+            if int(request["version"]) != int(data["expected_version"]):
+                raise ConflictError("发放申请版本冲突", context={"current_version": request["version"]})
             if not data.get("reason"):
                 raise ValidationError("拒绝申请时必须填写原因")
+            timestamp = to_storage(self.clock.now())
             self.connection.execute(
                 "UPDATE distribution_requests SET status='rejected',reviewed_by=?,reviewed_at=?,decision_reason=?,"
                 "version=version+1 WHERE id=? AND version=?",
                 (data["actor"], timestamp, data["reason"], request_id, data["expected_version"]),
             )
             return self.repository.distribution_detail(request_id)
-        items = self.repository.distribution_detail(request_id)["items"]
-        allocations: list[tuple[int, int]] = []
-        for item in items:
-            lot = self._choose_lot(int(item["accession_id"]), float(item["quantity_grams"]))
-            if lot is None:
-                raise ConflictError("没有满足重量与活力条件的可发放批次", context={"accession_id": item["accession_id"]})
-            allocations.append((int(item["id"]), int(lot["id"])))
-        for item_id, lot_id in allocations:
-            self.connection.execute(
-                "UPDATE distribution_items SET allocated_lot_id=?,status='allocated' WHERE id=?", (lot_id, item_id)
-            )
-        self.connection.execute(
-            "UPDATE distribution_requests SET status='approved',reviewed_by=?,reviewed_at=?,decision_reason=?,"
-            "version=version+1 WHERE id=? AND version=?",
-            (data["actor"], timestamp, data.get("reason", ""), request_id, data["expected_version"]),
-        )
-        return self.repository.distribution_detail(request_id)
+        # 批准：在同一事务内选批并锁定重量；预约已存在时（审批重放）原额返回，不重复占用。
+        from app.germplasm.reservations import ReservationService
 
-    def _choose_lot(self, accession_id: int, quantity: float) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT l.*,v.germination_percent,v.completed_at FROM seed_lots l "
-            "LEFT JOIN viability_tests v ON v.id=(SELECT id FROM viability_tests WHERE lot_id=l.id AND status='completed' "
-            "ORDER BY completed_at DESC,id DESC LIMIT 1) WHERE l.accession_id=? AND l.status='stored' "
-            "AND l.available_weight_grams>=? AND NOT EXISTS(SELECT 1 FROM lot_holds h WHERE h.lot_id=l.id AND h.released_at IS NULL) "
-            "ORDER BY CASE WHEN v.germination_percent IS NULL THEN 1 ELSE 0 END,v.completed_at,l.harvest_year,l.lot_no LIMIT 1",
-            (accession_id, quantity),
-        ).fetchone()
-        return record(row)
+        reservation = ReservationService(self.connection, self.clock).reserve_for_decision(request_id, data)
+        result = self.repository.distribution_detail(request_id)
+        result["reservation"] = reservation
+        return result

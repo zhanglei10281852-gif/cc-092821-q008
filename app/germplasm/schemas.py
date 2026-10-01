@@ -295,6 +295,37 @@ class DistributionDecision(BaseModel):
     expected_version: int = Field(gt=0)
     actor: str = Field(min_length=1, max_length=100)
     reason: str = Field(default="", max_length=500)
+    reservation_days: int = Field(default=7, ge=1, le=90)
+
+
+class DistributionCancel(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class ReservationActor(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+
+
+class ReservationRollback(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class ReservationPick(BaseModel):
+    quantity_grams: float = Field(gt=0)
+    idempotency_key: str = Field(min_length=8, max_length=100)
+    actor: str = Field(min_length=1, max_length=100)
+    shipment_no: str | None = Field(default=None, max_length=100)
+    consignee: str = Field(default="", max_length=200)
+    reason: str = Field(default="", max_length=500)
+
+
+class ReservationReturn(BaseModel):
+    quantity_grams: float = Field(gt=0)
+    idempotency_key: str = Field(min_length=8, max_length=100)
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=2, max_length=500)
 
 
 class Page(BaseModel):

@@ -24,6 +24,7 @@ def check_command() -> dict:
     required = {
         "accessions", "seed_lots", "storage_locations", "viability_tests",
         "retest_schedules", "quality_alerts", "outbox_events",
+        "reservations", "reservation_lines", "reservation_fulfillments", "reservation_events",
     }
     actual = {
         row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -100,6 +101,13 @@ def demo_command() -> dict:
     }
 
 
+def reclaim_command() -> dict:
+    init_db()
+    with transaction(immediate=True) as connection:
+        reclaimed = GermplasmService(connection).reservations.expire_due()
+    return {"reclaimed_count": len(reclaimed), "reservation_ids": [item["id"] for item in reclaimed]}
+
+
 def export_command(path: str) -> dict:
     init_db()
     service = GermplasmService(get_connection())
@@ -117,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check-db", help="检查数据库完整性")
     subparsers.add_parser("smoke", help="执行 HTTP 冒烟检查")
     subparsers.add_parser("demo", help="写入一组示范入库数据")
+    subparsers.add_parser("reclaim-expired", help="回收已到期的库存预约并释放锁定重量")
     export = subparsers.add_parser("export-accessions", help="导出资源档案")
     export.add_argument("path")
     return parser
@@ -133,6 +142,8 @@ def main() -> int:
             result = smoke_command()
         elif args.command == "demo":
             result = demo_command()
+        elif args.command == "reclaim-expired":
+            result = reclaim_command()
         else:
             result = export_command(args.path)
         print(json.dumps(result, ensure_ascii=False, indent=2))
