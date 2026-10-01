@@ -277,11 +277,18 @@ class ViabilityService:
         test = self.repository.require_test(test_id)
         key = f"low-viability-{test_id}"
         import json
-        self.connection.execute(
+        cursor = self.connection.execute(
             "INSERT OR IGNORE INTO quality_alerts(alert_key,alert_type,severity,lot_id,message,detail_json,created_at,updated_at) "
             "VALUES(?,'low_viability','critical',?,?,?,?,?)",
             (key, test["lot_id"], f"批次活力降至 {germination:.2f}%", json.dumps({"test_id": test_id, "value": germination}), timestamp, timestamp),
         )
+        if cursor.rowcount:
+            # 新出现的严重质量告警视为质量状态恶化，释放尚未拣货的预约
+            from app.germplasm.reservations import ReservationService
+
+            ReservationService(self.connection, self.clock).release_for_deterioration(
+                int(test["lot_id"]), "system", f"活力 {germination:.2f}% 低于红线"
+            )
 
 
 def add_months(value: date, months: int) -> date:

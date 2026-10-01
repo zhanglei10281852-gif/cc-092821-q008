@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS lot_movements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
     placement_id INTEGER REFERENCES lot_placements(id),
-    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','归还','报废','盘点调整')),
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('入库','移库','取样','领用','出库发放','归还','报废','盘点调整')),
     quantity_grams REAL NOT NULL,
     from_location_id INTEGER REFERENCES storage_locations(id),
     to_location_id INTEGER REFERENCES storage_locations(id),
@@ -359,11 +359,12 @@ CREATE TABLE IF NOT EXISTS distribution_requests (
     request_no TEXT NOT NULL UNIQUE,
     requester TEXT NOT NULL,
     purpose TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','submitted','approved','rejected','fulfilled','cancelled')),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','submitted','approved','picking','rejected','fulfilled','cancelled','expired')),
     requested_at TEXT NOT NULL,
     reviewed_by TEXT,
     reviewed_at TEXT,
     decision_reason TEXT,
+    reservation_expires_at TEXT,
     version INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS distribution_items (
@@ -372,9 +373,83 @@ CREATE TABLE IF NOT EXISTS distribution_items (
     accession_id INTEGER NOT NULL REFERENCES accessions(id) ON DELETE RESTRICT,
     quantity_grams REAL NOT NULL CHECK(quantity_grams > 0),
     allocated_lot_id INTEGER REFERENCES seed_lots(id),
-    status TEXT NOT NULL DEFAULT 'requested' CHECK(status IN ('requested','allocated','fulfilled','unavailable')),
+    status TEXT NOT NULL DEFAULT 'requested' CHECK(status IN ('requested','allocated','picking','fulfilled','unavailable','released')),
     UNIQUE(request_id,accession_id)
 );
+CREATE TABLE IF NOT EXISTS lot_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_no TEXT NOT NULL UNIQUE,
+    request_id INTEGER NOT NULL REFERENCES distribution_requests(id) ON DELETE RESTRICT,
+    item_id INTEGER NOT NULL REFERENCES distribution_items(id) ON DELETE RESTRICT,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    quantity_grams REAL NOT NULL CHECK(quantity_grams > 0),
+    allocation_rank INTEGER NOT NULL CHECK(allocation_rank >= 1),
+    rule_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','picking','fulfilled','released')),
+    expires_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    picked_at TEXT,
+    picked_by TEXT,
+    fulfilled_at TEXT,
+    fulfilled_by TEXT,
+    released_at TEXT,
+    released_by TEXT,
+    release_reason TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(item_id,allocation_rank)
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_lot ON lot_reservations(lot_id,status);
+CREATE INDEX IF NOT EXISTS idx_reservations_request ON lot_reservations(request_id,status);
+CREATE INDEX IF NOT EXISTS idx_reservations_expires ON lot_reservations(status,expires_at);
+CREATE TABLE IF NOT EXISTS reservation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id INTEGER NOT NULL REFERENCES lot_reservations(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL CHECK(event_type IN ('created','released','picking','rollback','takeover','fulfilled')),
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reservation_events ON reservation_events(reservation_id,id);
+CREATE TABLE IF NOT EXISTS outbound_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbound_no TEXT NOT NULL UNIQUE,
+    reservation_id INTEGER NOT NULL REFERENCES lot_reservations(id) ON DELETE RESTRICT,
+    request_id INTEGER NOT NULL REFERENCES distribution_requests(id) ON DELETE RESTRICT,
+    item_id INTEGER NOT NULL REFERENCES distribution_items(id) ON DELETE RESTRICT,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    movement_id INTEGER REFERENCES lot_movements(id),
+    quantity_grams REAL NOT NULL CHECK(quantity_grams > 0),
+    recipient TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    shipped_by TEXT NOT NULL,
+    shipped_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_lot ON outbound_records(lot_id,id);
+CREATE INDEX IF NOT EXISTS idx_outbound_request ON outbound_records(request_id,id);
+CREATE TRIGGER IF NOT EXISTS trg_reservation_no_oversell
+BEFORE INSERT ON lot_reservations
+WHEN NEW.status IN ('active','picking')
+BEGIN
+    SELECT CASE WHEN NEW.quantity_grams > (
+        SELECT l.available_weight_grams - COALESCE((
+            SELECT SUM(r.quantity_grams) FROM lot_reservations r
+            WHERE r.lot_id = NEW.lot_id AND r.status IN ('active','picking')
+        ), 0) FROM seed_lots l WHERE l.id = NEW.lot_id
+    ) THEN RAISE(ABORT, '预约重量超过批次可预约余额，禁止超卖') END;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_reservation_update_no_oversell
+BEFORE UPDATE OF quantity_grams,status ON lot_reservations
+WHEN NEW.status IN ('active','picking')
+BEGIN
+    SELECT CASE WHEN NEW.quantity_grams > (
+        SELECT l.available_weight_grams - COALESCE((
+            SELECT SUM(r.quantity_grams) FROM lot_reservations r
+            WHERE r.lot_id = NEW.lot_id AND r.status IN ('active','picking') AND r.id != NEW.id
+        ), 0) FROM seed_lots l WHERE l.id = NEW.lot_id
+    ) THEN RAISE(ABORT, '预约变更后超过批次可预约余额，禁止超卖') END;
+END;
 CREATE TABLE IF NOT EXISTS outbox_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_key TEXT NOT NULL UNIQUE,
@@ -411,6 +486,7 @@ PERMISSIONS = [
     ("viability.write", "执行活力检测", "viability", "write"),
     ("quality.review", "复核质量结果", "quality", "review"),
     ("distribution.approve", "审批种质发放", "distribution", "approve"),
+    ("distribution.operate", "执行发放出库", "distribution", "operate"),
 ]
 
 
@@ -468,10 +544,113 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _migrate_legacy_constraints(connection: sqlite3.Connection) -> None:
+    """旧库的 CHECK 约束无法 ALTER，按 SQLite 官方流程重建相关表并保留数据。"""
+    request_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='distribution_requests'"
+    ).fetchone()
+    item_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='distribution_items'"
+    ).fetchone()
+    movement_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='lot_movements'"
+    ).fetchone()
+    needs_requests = request_sql is not None and "'picking'" not in request_sql[0]
+    needs_items = item_sql is not None and "'released'" not in item_sql[0]
+    needs_movements = movement_sql is not None and "出库发放" not in movement_sql[0]
+    if not (needs_requests or needs_items or needs_movements):
+        return
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    script = ["BEGIN IMMEDIATE;"]
+    try:
+        if needs_items:
+            script.append(
+                """
+                CREATE TABLE distribution_items_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL REFERENCES distribution_requests(id) ON DELETE CASCADE,
+                    accession_id INTEGER NOT NULL REFERENCES accessions(id) ON DELETE RESTRICT,
+                    quantity_grams REAL NOT NULL CHECK(quantity_grams > 0),
+                    allocated_lot_id INTEGER REFERENCES seed_lots(id),
+                    status TEXT NOT NULL DEFAULT 'requested'
+                        CHECK(status IN ('requested','allocated','picking','fulfilled','unavailable','released')),
+                    UNIQUE(request_id,accession_id)
+                );
+                INSERT INTO distribution_items_new
+                    SELECT id,request_id,accession_id,quantity_grams,allocated_lot_id,status FROM distribution_items;
+                DROP TABLE distribution_items;
+                ALTER TABLE distribution_items_new RENAME TO distribution_items;
+                """
+            )
+        if needs_requests:
+            script.append(
+                """
+                CREATE TABLE distribution_requests_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_no TEXT NOT NULL UNIQUE,
+                    requester TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'draft'
+                        CHECK(status IN ('draft','submitted','approved','picking','rejected','fulfilled','cancelled','expired')),
+                    requested_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    decision_reason TEXT,
+                    reservation_expires_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+                INSERT INTO distribution_requests_new
+                    SELECT id,request_no,requester,purpose,status,requested_at,reviewed_by,reviewed_at,
+                           decision_reason,NULL,version FROM distribution_requests;
+                DROP TABLE distribution_requests;
+                ALTER TABLE distribution_requests_new RENAME TO distribution_requests;
+                """
+            )
+        if needs_movements:
+            script.append(
+                """
+                CREATE TABLE lot_movements_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
+                    placement_id INTEGER REFERENCES lot_placements(id),
+                    movement_type TEXT NOT NULL
+                        CHECK(movement_type IN ('入库','移库','取样','领用','出库发放','归还','报废','盘点调整')),
+                    quantity_grams REAL NOT NULL,
+                    from_location_id INTEGER REFERENCES storage_locations(id),
+                    to_location_id INTEGER REFERENCES storage_locations(id),
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO lot_movements_new
+                    SELECT id,lot_id,placement_id,movement_type,quantity_grams,from_location_id,to_location_id,
+                           idempotency_key,actor,reason,created_at FROM lot_movements;
+                DROP TABLE lot_movements;
+                ALTER TABLE lot_movements_new RENAME TO lot_movements;
+                CREATE INDEX IF NOT EXISTS idx_movements_lot ON lot_movements(lot_id,id);
+                """
+            )
+        script.append("COMMIT;")
+        connection.executescript("\n".join(script))
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
+    connection = get_connection()
+    _migrate_legacy_constraints(connection)
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        # 既有库的增量列：IF NOT EXISTS 只覆盖建表，新增列需显式补齐
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(distribution_requests)")}
+        if "reservation_expires_at" not in columns:
+            connection.execute("ALTER TABLE distribution_requests ADD COLUMN reservation_expires_at TEXT")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -497,7 +676,7 @@ def init_db() -> None:
         role_permissions = {
             "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
             "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
-            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
+            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve", "distribution.operate"],
             "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
         }
         for role_code, codes in role_permissions.items():

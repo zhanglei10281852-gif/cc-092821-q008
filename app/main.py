@@ -7,7 +7,8 @@ from fastapi.responses import JSONResponse
 
 from app.api import audit, auth, roles, system, users
 from app.core.errors import DomainError
-from app.database import close_connection, init_db
+from app.database import close_connection, init_db, transaction
+from app.germplasm.quality import DistributionService
 from app.germplasm.router import router as germplasm_router
 
 
@@ -15,6 +16,9 @@ from app.germplasm.router import router as germplasm_router
 async def lifespan(app: FastAPI):
     del app
     init_db()
+    # 服务重启后回收到期但未来得及释放的预约
+    with transaction(immediate=True) as connection:
+        DistributionService(connection).reclaim_expired()
     yield
     close_connection()
 

@@ -6,6 +6,7 @@ from typing import Any
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
 from app.germplasm.repository import GermplasmRepository, record
+from app.germplasm.reservations import ReservationService
 
 
 class InventoryService:
@@ -162,8 +163,18 @@ class InventoryService:
         if holds:
             raise ConflictError("批次存在未解除的质量或权限冻结", context={"holds": [item["id"] for item in holds]})
         quantity = float(data["quantity_grams"])
-        if quantity > float(lot["available_weight_grams"]) + 1e-9:
-            raise ConflictError("批次可用重量不足")
+        quantities = self.repository.lot_quantities(int(lot["id"]), on_hand=float(lot["available_weight_grams"]))
+        free_grams = float(quantities["available_grams"])
+        if quantity > free_grams + 1e-9:
+            raise ConflictError(
+                "批次可自由动用重量不足（其余重量已被有效预约锁定）",
+                context={
+                    "on_hand_grams": quantities["on_hand_grams"],
+                    "reserved_grams": quantities["reserved_grams"],
+                    "picking_grams": quantities["picking_grams"],
+                    "free_grams": round(free_grams, 6),
+                },
+            )
         timestamp = to_storage(self.clock.now())
         remaining = round(float(lot["available_weight_grams"]) - quantity, 6)
         status = "depleted" if remaining <= 1e-9 else lot["status"]
@@ -199,7 +210,13 @@ class InventoryService:
             "UPDATE seed_lots SET status='held',version=version+1,updated_at=? WHERE id=? AND status NOT IN ('depleted','disposed')",
             (timestamp, lot["id"]),
         )
-        return record(self.connection.execute("SELECT * FROM lot_holds WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+        # 质量状态恶化：释放仍在等待拣货的预约并记录原因；已进入拣货的只能人工接管或回退
+        released = ReservationService(self.connection, self.clock).release_for_deterioration(
+            int(lot["id"]), data["actor"], f"{data['hold_type']}冻结：{data['reason']}"
+        )
+        hold = record(self.connection.execute("SELECT * FROM lot_holds WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+        hold["released_reservations"] = [item["id"] for item in released]
+        return hold
 
     def release_hold(self, hold_id: int, actor: str, reason: str) -> dict[str, Any]:
         hold = record(self.connection.execute("SELECT * FROM lot_holds WHERE id=?", (hold_id,)).fetchone())
@@ -224,7 +241,8 @@ class InventoryService:
     def reconcile(self, lot_id: int) -> dict[str, Any]:
         lot = self.repository.require_lot(lot_id)
         movement_total = float(self.connection.execute(
-            "SELECT COALESCE(SUM(quantity_grams),0) FROM lot_movements WHERE lot_id=? AND movement_type IN ('取样','领用','报废','归还','盘点调整')",
+            "SELECT COALESCE(SUM(quantity_grams),0) FROM lot_movements "
+            "WHERE lot_id=? AND movement_type IN ('取样','领用','出库发放','报废','归还','盘点调整')",
             (lot_id,),
         ).fetchone()[0])
         expected_available = round(float(lot["initial_weight_grams"]) + movement_total, 6)

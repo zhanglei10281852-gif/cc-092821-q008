@@ -295,6 +295,38 @@ class DistributionDecision(BaseModel):
     expected_version: int = Field(gt=0)
     actor: str = Field(min_length=1, max_length=100)
     reason: str = Field(default="", max_length=500)
+    reservation_hours: int | None = Field(default=None, ge=1, le=24 * 90)
+
+
+class DistributionCancel(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(default="申请取消", min_length=2, max_length=500)
+
+
+class PickingStart(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+
+
+class ReservationTakeover(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class ReservationRollback(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=2, max_length=500)
+
+
+class ShipmentCreate(BaseModel):
+    outbound_no: str = Field(min_length=3, max_length=60)
+    recipient: str = Field(min_length=1, max_length=200)
+    actor: str = Field(min_length=1, max_length=100)
+    note: str = Field(default="", max_length=500)
+
+    @field_validator("outbound_no")
+    @classmethod
+    def normalize_outbound_no(cls, value: str) -> str:
+        return value.strip().upper()
 
 
 class Page(BaseModel):

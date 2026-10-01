@@ -12,6 +12,7 @@ JSON_COLUMNS = {
     "restrictions_json": "restrictions",
     "detail_json": "detail",
     "payload_json": "payload",
+    "rule_snapshot_json": "rule_snapshot",
 }
 
 
@@ -132,6 +133,15 @@ class GermplasmRepository:
             "SELECT * FROM viability_tests WHERE lot_id=? AND status='completed' ORDER BY completed_at DESC,id DESC LIMIT 1",
             (lot_id,),
         ).fetchone())
+        quantities = self.lot_quantities(lot_id, on_hand=float(item["available_weight_grams"]))
+        item["quantities"] = quantities
+        item["reservations"] = records(self.connection.execute(
+            "SELECT r.*,d.request_no FROM lot_reservations r "
+            "JOIN distribution_requests d ON d.id=r.request_id WHERE r.lot_id=? ORDER BY r.id", (lot_id,)
+        ).fetchall())
+        item["outbound_records"] = records(self.connection.execute(
+            "SELECT * FROM outbound_records WHERE lot_id=? ORDER BY id", (lot_id,)
+        ).fetchall())
         return item
 
     def require_placement(self, placement_id: int) -> dict[str, Any]:
@@ -194,13 +204,88 @@ class GermplasmRepository:
             raise NotFoundError("发放申请不存在")
         return item
 
+    def require_distribution_item(self, item_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM distribution_items WHERE id=?", (item_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("发放明细不存在")
+        return item
+
+    def require_reservation(self, reservation_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM lot_reservations WHERE id=?", (reservation_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("库存预约不存在")
+        return item
+
+    def reservation_detail(self, reservation_id: int) -> dict[str, Any]:
+        reservation = self.require_reservation(reservation_id)
+        reservation["events"] = records(self.connection.execute(
+            "SELECT * FROM reservation_events WHERE reservation_id=? ORDER BY id", (reservation_id,)
+        ).fetchall())
+        reservation["outbound"] = record(self.connection.execute(
+            "SELECT * FROM outbound_records WHERE reservation_id=?", (reservation_id,)
+        ).fetchone())
+        return reservation
+
     def distribution_detail(self, request_id: int) -> dict[str, Any]:
         item = self.require_distribution(request_id)
         item["items"] = records(self.connection.execute(
             "SELECT i.*,a.accession_no,a.crop_name FROM distribution_items i "
             "JOIN accessions a ON a.id=i.accession_id WHERE i.request_id=? ORDER BY i.id", (request_id,)
         ).fetchall())
+        reservations = records(self.connection.execute(
+            "SELECT r.*,l.lot_no,a.accession_no FROM lot_reservations r "
+            "JOIN seed_lots l ON l.id=r.lot_id JOIN distribution_items i ON i.id=r.item_id "
+            "JOIN accessions a ON a.id=i.accession_id WHERE r.request_id=? ORDER BY r.item_id,r.allocation_rank",
+            (request_id,),
+        ).fetchall())
+        item["reservations"] = reservations
+        by_item: dict[int, list[dict[str, Any]]] = {}
+        for reservation in reservations:
+            by_item.setdefault(int(reservation["item_id"]), []).append(reservation)
+        for line in item["items"]:
+            grouped = by_item.get(int(line["id"]), [])
+            active = round(sum(float(r["quantity_grams"]) for r in grouped if r["status"] == "active"), 6)
+            picking = round(sum(float(r["quantity_grams"]) for r in grouped if r["status"] == "picking"), 6)
+            fulfilled = round(sum(float(r["quantity_grams"]) for r in grouped if r["status"] == "fulfilled"), 6)
+            released = round(sum(float(r["quantity_grams"]) for r in grouped if r["status"] == "released"), 6)
+            line["quantities"] = {
+                "requested_grams": round(float(line["quantity_grams"]), 6),
+                "reserved_grams": active,
+                "picking_grams": picking,
+                "outbound_grams": fulfilled,
+                "released_grams": released,
+            }
+            line["reservations"] = grouped
+            line["source_rules"] = grouped[0]["rule_snapshot"].get("rules", []) if grouped else []
+        item["outbound_records"] = records(self.connection.execute(
+            "SELECT o.*,l.lot_no,a.accession_no FROM outbound_records o "
+            "JOIN seed_lots l ON l.id=o.lot_id JOIN distribution_items i ON i.id=o.item_id "
+            "JOIN accessions a ON a.id=i.accession_id WHERE o.request_id=? ORDER BY o.id",
+            (request_id,),
+        ).fetchall())
         return item
+
+    def lot_quantities(self, lot_id: int, *, on_hand: float | None = None) -> dict[str, float]:
+        if on_hand is None:
+            on_hand = float(self.require_lot(lot_id)["available_weight_grams"])
+        row = self.connection.execute(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN status='active' THEN quantity_grams END),0) AS active_reserved_grams,"
+            "COALESCE(SUM(CASE WHEN status='picking' THEN quantity_grams END),0) AS picking_grams,"
+            "COALESCE(SUM(CASE WHEN status='fulfilled' THEN quantity_grams END),0) AS outbound_grams "
+            "FROM lot_reservations WHERE lot_id=?",
+            (lot_id,),
+        ).fetchone()
+        reserved = round(float(row["active_reserved_grams"]), 6)
+        picking = round(float(row["picking_grams"]), 6)
+        outbound = round(float(row["outbound_grams"]), 6)
+        return {
+            "on_hand_grams": round(on_hand, 6),
+            "reserved_grams": reserved,
+            "picking_grams": picking,
+            "available_grams": round(on_hand - reserved - picking, 6),
+            "outbound_grams": outbound,
+        }
 
     def count_table(self, table: str) -> int:
         allowed = {
